@@ -52,7 +52,7 @@ async fn get_jwks_from_file_or_url(
     p: &str,
 ) -> Result<jwk::JwkSet, JwksGetError> {
     let mut url = Url::parse(p).map_err(|e| JwksGetError::InvalidSourcePath(e.to_string()))?;
-    match url.scheme() {
+    let jwkset = match url.scheme() {
         "https" => {
             url.set_path(OPENID_CONFIG_URL_SUFFIX);
 
@@ -88,7 +88,23 @@ async fn get_jwks_from_file_or_url(
             "unsupported scheme {} (must be either file or https)",
             url.scheme()
         ))),
+    }?;
+
+    // jsonwebtoken 10 maps unrecognized algorithms to this catch-all instead
+    // of rejecting them during deserialization. Keep trusted JWKS loading
+    // strict, as it was before the dependency upgrade.
+    if jwkset.keys.iter().any(|key| {
+        matches!(
+            key.common.key_algorithm,
+            Some(jwk::KeyAlgorithm::UNKNOWN_ALGORITHM)
+        )
+    }) {
+        return Err(JwksGetError::DeserializeSource(
+            "unsupported JWK algorithm".to_string(),
+        ));
     }
+
+    Ok(jwkset)
 }
 
 fn new_http_client() -> reqwest::Client {
@@ -291,8 +307,46 @@ impl JwkAttestationTokenVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::get_jwks_from_file_or_url;
+    use super::{get_jwks_from_file_or_url, JwkAttestationTokenVerifier};
+    use base64::Engine;
+    use jsonwebtoken::{encode, jwk, Algorithm, EncodingKey, Header};
     use rstest::rstest;
+    use serde_json::{json, Value};
+
+    #[rstest]
+    #[case(None, false)]
+    #[case(Some(json!(0)), false)]
+    #[case(Some(json!("99999999999")), true)]
+    #[case(Some(json!(true)), true)]
+    #[case(Some(json!({"time": 0})), true)]
+    #[tokio::test]
+    async fn test_nbf_claim_type(#[case] nbf: Option<Value>, #[case] expect_error: bool) {
+        let secret = b"test-only symmetric key for registered-claim validation";
+        let verifier = JwkAttestationTokenVerifier {
+            trusted_jwk_sets: serde_json::from_value::<jwk::JwkSet>(json!({
+                "keys": [{
+                    "kty": "oct",
+                    "alg": "HS256",
+                    "kid": "test-key",
+                    "k": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret),
+                }],
+            }))
+            .unwrap(),
+            trusted_certs: Vec::new(),
+            insecure_key: false,
+        };
+        let header = Header {
+            kid: Some("test-key".into()),
+            ..Header::new(Algorithm::HS256)
+        };
+        let mut claims = json!({"exp": 99_999_999_999_u64});
+        if let Some(nbf) = nbf {
+            claims["nbf"] = nbf;
+        }
+        let token = encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        assert_eq!(verifier.verify(token).await.is_err(), expect_error);
+    }
 
     #[rstest]
     #[case("https://", true)]
@@ -317,6 +371,18 @@ mod tests {
     )]
     #[case(
         "{\"keys\":[{\"kty\":\"oct\",\"alg\":\"COCO42\",\"kid\":\"coco123\",\"k\":\"foobar\"}]}",
+        true
+    )]
+    #[case(
+        "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"coco123\",\"k\":\"foobar\"}]}",
+        false
+    )]
+    #[case(
+        "{\"keys\":[{\"kty\":\"RSA\",\"alg\":\"RSA-OAEP-256\",\"kid\":\"encryption\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}",
+        false
+    )]
+    #[case(
+        "{\"keys\":[{\"kty\":\"oct\",\"alg\":\"HS256\",\"kid\":\"valid\",\"k\":\"foobar\"},{\"kty\":\"oct\",\"alg\":\"COCO42\",\"kid\":\"invalid\",\"k\":\"foobar\"}]}",
         true
     )]
     #[tokio::test]
